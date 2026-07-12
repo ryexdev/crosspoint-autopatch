@@ -1,0 +1,126 @@
+name: Autopatch Build
+# Polls the official CrossPoint repo for new releases. When one appears,
+# rebuilds it with the patches in patches/ applied and publishes the result
+# as a release on this repo (same tag, firmware.bin asset). The device's OTA
+# updater is patched to point here, so it self-updates with the fix applied.
+
+on:
+  schedule:
+    - cron: '17 */6 * * *' # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM: crosspoint-reader/crosspoint-reader
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.compare.outputs.tag }}
+      build: ${{ steps.compare.outputs.build }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compare upstream release with ours
+        id: compare
+        run: |
+          UPSTREAM_TAG=$(gh api "repos/$UPSTREAM/releases/latest" -q .tag_name)
+          if [ -z "$UPSTREAM_TAG" ]; then
+            echo "Could not read upstream latest release tag" >&2
+            exit 1
+          fi
+          OWN_TAG=$(gh api "repos/${{ github.repository }}/releases/latest" -q .tag_name 2>/dev/null || echo "none")
+          echo "Upstream: $UPSTREAM_TAG  Ours: $OWN_TAG"
+          echo "tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          if [ "$UPSTREAM_TAG" = "$OWN_TAG" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # GitHub disables scheduled workflows in repos with no commit activity
+      # for 60 days. Push an empty keepalive commit before that happens.
+      - name: Keepalive
+        run: |
+          LAST=$(git log -1 --format=%ct)
+          AGE_DAYS=$(( ( $(date +%s) - LAST ) / 86400 ))
+          if [ "$AGE_DAYS" -ge 50 ]; then
+            git config user.name "autopatch-bot"
+            git config user.email "actions@github.com"
+            git commit --allow-empty -m "chore: keepalive"
+            git push
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Clone upstream at release tag
+        run: |
+          git clone --depth 1 --branch "${{ needs.check.outputs.tag }}" \
+            --recurse-submodules --shallow-submodules \
+            "https://github.com/$UPSTREAM" upstream
+
+      # Strict application: any conflict with upstream changes fails the job,
+      # which emails the repo owner. Review the drift, refresh the patch,
+      # re-run the workflow.
+      - name: Apply patches
+        run: |
+          cd upstream
+          for p in ../patches/*.patch; do
+            echo "=== Applying $p"
+            git apply --verbose "$p"
+          done
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: false
+
+      - name: Install PlatformIO Core
+        run: uv pip install --system -U https://github.com/pioarduino/platformio-core/archive/refs/tags/v6.1.19.zip
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('upstream/platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Build CrossPoint (gh_release)
+        working-directory: upstream
+        run: pio run -e gh_release
+
+      - name: Publish release
+        run: |
+          TAG="${{ needs.check.outputs.tag }}"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "CrossPoint $TAG + autopatch" \
+            --notes "Official [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) rebuilt with patches/ applied. Built by the autopatch workflow." \
+            upstream/.pio/build/gh_release/firmware.bin \
+            upstream/.pio/build/gh_release/bootloader.bin \
+            upstream/.pio/build/gh_release/partitions.bin
+
+      - name: Open issue on failure
+        if: failure()
+        run: |
+          TAG="${{ needs.check.outputs.tag }}"
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Autopatch build failed for $TAG" \
+            --body "The autopatch build for upstream release **$TAG** failed — most likely a patch no longer applies because upstream changed that code. See the [run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Review upstream's changes, refresh the patch in patches/, and re-run the workflow." \
+            || true

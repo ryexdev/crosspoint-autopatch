@@ -1,0 +1,31 @@
+From 5bdc60f9ac3df2f4c3166d1d6c48a4c7a2805dfb Mon Sep 17 00:00:00 2001
+From: Ryan Henderson <ryexdev@gmail.com>
+Date: Sun, 12 Jul 2026 10:30:40 -0700
+Subject: [PATCH] fix: point OTA updater at ryexdev/crosspoint-autopatch
+ releases
+
+The autopatch pipeline rebuilds each official release with the SD init
+retry fix and publishes it on ryexdev/crosspoint-autopatch. Pointing the
+on-device update check there keeps the fix applied across updates.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/network/OtaUpdater.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/network/OtaUpdater.cpp b/src/network/OtaUpdater.cpp
+index 63a1903f..5b119135 100644
+--- a/src/network/OtaUpdater.cpp
++++ b/src/network/OtaUpdater.cpp
+@@ -17,7 +17,7 @@
+ #include <string>
+ 
+ namespace {
+-constexpr char latestReleaseUrl[] = "https://api.github.com/repos/crosspoint-reader/crosspoint-reader/releases/latest";
++constexpr char latestReleaseUrl[] = "https://api.github.com/repos/ryexdev/crosspoint-autopatch/releases/latest";
+ 
+ esp_err_t http_client_set_header_cb(esp_http_client_handle_t http_client) {
+   return esp_http_client_set_header(http_client, "User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
+-- 
+2.50.1 (Apple Git-155)
+

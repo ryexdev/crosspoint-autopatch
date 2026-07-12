@@ -1,0 +1,47 @@
+From 38fe42f47fec1a364df092ab587e5dcf8b497690 Mon Sep 17 00:00:00 2001
+From: Ryan Henderson <ryexdev@gmail.com>
+Date: Sat, 27 Jun 2026 21:29:34 -0700
+Subject: [PATCH] fix: retry SD card init before showing error
+
+A slow or marginal SD card can fail the very first probe right after a
+cold boot or wake-from-sleep (power/clock not settled yet), producing an
+immediate "SD card error" screen even though the card is fine once it
+settles. Retry Storage.begin() up to 5 times with a 100 ms delay before
+giving up. SDCardManager::begin() re-runs sd.begin() on each call, so
+re-probing is safe.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/main.cpp | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/main.cpp b/src/main.cpp
+index 13ba129b..ac753335 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -334,8 +334,20 @@ void setup() {
+   LOG_INF("MAIN", "Hardware detect: %s", gpio.deviceIsX3() ? "X3" : "X4");
+ 
+   // SD Card Initialization
+-  // We need 6 open files concurrently when parsing a new chapter
+-  if (!Storage.begin()) {
++  // We need 6 open files concurrently when parsing a new chapter.
++  // A slow or marginal card can fail the very first probe on wake-from-sleep
++  // (power/clock not yet settled). Retry a few times with a short delay before
++  // declaring an error instead of failing on a single shot.
++  bool sdReady = false;
++  for (int attempt = 1; attempt <= 5; ++attempt) {
++    if (Storage.begin()) {
++      sdReady = true;
++      break;
++    }
++    LOG_ERR("MAIN", "SD card init attempt %d/5 failed, retrying", attempt);
++    delay(100);
++  }
++  if (!sdReady) {
+     LOG_ERR("MAIN", "SD card initialization failed");
+     setupDisplayAndFonts(isSilentReboot);
+     activityManager.goToFullScreenMessage("SD card error", EpdFontFamily::BOLD);
+-- 
+2.50.1 (Apple Git-155)
+
