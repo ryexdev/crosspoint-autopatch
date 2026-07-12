@@ -1,7 +1,7 @@
 From 38fe42f47fec1a364df092ab587e5dcf8b497690 Mon Sep 17 00:00:00 2001
 From: Ryan Henderson <ryexdev@gmail.com>
 Date: Sat, 27 Jun 2026 21:29:34 -0700
-Subject: [PATCH] fix: retry SD card init before showing error
+Subject: [PATCH 1/2] fix: retry SD card init before showing error
 
 A slow or marginal SD card can fail the very first probe right after a
 cold boot or wake-from-sleep (power/clock not settled yet), producing an
@@ -42,6 +42,61 @@ index 13ba129b..ac753335 100644
      LOG_ERR("MAIN", "SD card initialization failed");
      setupDisplayAndFonts(isSilentReboot);
      activityManager.goToFullScreenMessage("SD card error", EpdFontFamily::BOLD);
+-- 
+2.50.1 (Apple Git-155)
+
+
+From d9f0604553be6b0cd4b3e2d9a117a3811f326d3f Mon Sep 17 00:00:00 2001
+From: Ryan Henderson <ryexdev@gmail.com>
+Date: Sun, 12 Jul 2026 11:27:11 -0700
+Subject: [PATCH 2/2] fix: widen SD init retry window with growing backoff
+
+Sleep releases the battery latch (HalPowerManager::startDeepSleep pulls
+GPIO13 low), so every wake cold-powers the SD card. Serial capture shows
+the card can stay mute past the previous 5x100ms window. Grow the delay
+per attempt (10 attempts, ~5.5s worst case); a ready card still wins on
+the first probe so normal boots are not delayed.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/main.cpp | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/src/main.cpp b/src/main.cpp
+index ac753335..fd54654f 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -335,17 +335,24 @@ void setup() {
+ 
+   // SD Card Initialization
+   // We need 6 open files concurrently when parsing a new chapter.
+-  // A slow or marginal card can fail the very first probe on wake-from-sleep
+-  // (power/clock not yet settled). Retry a few times with a short delay before
+-  // declaring an error instead of failing on a single shot.
++  // Sleep releases the battery latch (see HalPowerManager::startDeepSleep), so
++  // every wake is a cold power-on for the SD card and its controller races our
++  // first probe. Cards can need multiple seconds of internal housekeeping
++  // before they respond, and the time varies per power-up. Retry with a
++  // growing backoff (~5.5s worst case) before declaring an error; when the
++  // card is ready immediately the first probe wins and boot is not delayed.
++  constexpr int SD_INIT_MAX_ATTEMPTS = 10;
++  constexpr int SD_INIT_RETRY_BASE_DELAY_MS = 100;
+   bool sdReady = false;
+-  for (int attempt = 1; attempt <= 5; ++attempt) {
++  for (int attempt = 1; attempt <= SD_INIT_MAX_ATTEMPTS; ++attempt) {
+     if (Storage.begin()) {
+       sdReady = true;
+       break;
+     }
+-    LOG_ERR("MAIN", "SD card init attempt %d/5 failed, retrying", attempt);
+-    delay(100);
++    LOG_ERR("MAIN", "SD card init attempt %d/%d failed, retrying", attempt, SD_INIT_MAX_ATTEMPTS);
++    if (attempt < SD_INIT_MAX_ATTEMPTS) {
++      delay(SD_INIT_RETRY_BASE_DELAY_MS * attempt);
++    }
+   }
+   if (!sdReady) {
+     LOG_ERR("MAIN", "SD card initialization failed");
 -- 
 2.50.1 (Apple Git-155)
 
