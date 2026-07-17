@@ -1,0 +1,221 @@
+From dcbdb89f769358b45da8e5dfef4e623755ad36bf Mon Sep 17 00:00:00 2001
+From: Ryan Henderson <ryexdev@gmail.com>
+Date: Fri, 17 Jul 2026 05:22:41 +0000
+Subject: [PATCH] fix: make OPDS search work across libraries
+
+OPDS search failed on most servers for three reasons, all fixed here:
+
+1. Search was only detected when a <link rel="search"> href literally
+   contained {searchTerms}. The standard mechanism is an OpenSearch
+   description document (type application/opensearchdescription+xml) whose
+   href does NOT contain {searchTerms}; the real template lives inside it.
+   The parser now records that document's URL (getOpenSearchUrl), the
+   browser fetches it once, and extractOpenSearchTemplate() pulls out the
+   best {searchTerms} template (preferring an Atom/OPDS <Url>).
+
+2. performSearch replaced only {searchTerms} and left other OpenSearch
+   params ({startIndex?}, {count?}, ...) in the URL, which buildUrl then
+   percent-encoded to %7B...%7D and the server rejected. The template is
+   now expanded properly: the query is substituted (namespaced tokens like
+   {atom:searchTerms} included) and every other {param} is dropped.
+
+3. The search template is now kept across catalog navigation instead of
+   being cleared by sub-feeds that don't re-advertise it.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ lib/OpdsParser/OpdsParser.cpp                 | 51 +++++++++++++++++--
+ lib/OpdsParser/OpdsParser.h                   |  9 ++++
+ .../browser/OpdsBookBrowserActivity.cpp       | 43 ++++++++++++++--
+ .../browser/OpdsBookBrowserActivity.h         |  1 +
+ 4 files changed, 96 insertions(+), 8 deletions(-)
+
+diff --git a/lib/OpdsParser/OpdsParser.cpp b/lib/OpdsParser/OpdsParser.cpp
+index 26cdaed..0eb8b99 100644
+--- a/lib/OpdsParser/OpdsParser.cpp
++++ b/lib/OpdsParser/OpdsParser.cpp
+@@ -65,6 +65,7 @@ bool OpdsParser::error() const { return errorOccured; }
+ void OpdsParser::clear() {
+   entries.clear();
+   searchTemplate.clear();
++  openSearchUrl.clear();
+   nextPageUrl.clear();
+   prevPageUrl.clear();
+   currentEntry = OpdsEntry{};
+@@ -97,9 +98,17 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
+       const char* type = findAttribute(atts, "type");
+ 
+       if (rel && strcmp(rel, "search") == 0) {
+-        std::string sHref(href);
+-        if (sHref.find("{searchTerms}") != std::string::npos) {
+-          self->searchTemplate = sHref;
++        // Two ways a feed advertises search:
++        //  1. Inline template whose href holds the query slot, e.g.
++        //     href="/search?q={searchTerms}" (some servers namespace it,
++        //     e.g. {atom:searchTerms}) — match on the "searchTerms" token.
++        //  2. Indirection: href points at an OpenSearch description document
++        //     (type application/opensearchdescription+xml) that holds the real
++        //     template. Remember the URL so the caller can fetch and parse it.
++        if (strstr(href, "searchTerms") != nullptr) {
++          self->searchTemplate = href;
++        } else if (type != nullptr && strstr(type, "opensearchdescription") != nullptr) {
++          self->openSearchUrl = href;
+         }
+       } else if (rel && strcmp(rel, "next") == 0 && !self->inEntry) {
+         self->nextPageUrl = href;
+@@ -182,3 +191,39 @@ void XMLCALL OpdsParser::characterData(void* userData, const XML_Char* s, const
+     self->currentText.append(s, len);
+   }
+ }
++
++std::string OpdsParser::extractOpenSearchTemplate(const char* data, size_t len) {
++  // OpenSearch description document holds one or more:
++  //   <Url type="application/atom+xml" template="...{searchTerms}..."/>
++  // Pick the best template containing {searchTerms}, preferring an Atom/OPDS type.
++  struct Ctx {
++    std::string best;
++    bool bestPreferred = false;
++  } ctx;
++
++  XML_Parser p = XML_ParserCreate(nullptr);
++  if (!p) return "";
++  XML_SetUserData(p, &ctx);
++  XML_SetElementHandler(
++      p,
++      [](void* ud, const XML_Char* name, const XML_Char** atts) {
++        // Element may be namespaced, e.g. "os:Url".
++        if (strcmp(name, "Url") != 0 && strstr(name, ":Url") == nullptr) return;
++        const char* tmpl = findAttribute(atts, "template");
++        if (!tmpl || strstr(tmpl, "searchTerms") == nullptr) return;
++        const char* type = findAttribute(atts, "type");
++        const bool preferred = type != nullptr && (strstr(type, "atom") != nullptr || strstr(type, "opds") != nullptr);
++        auto* c = static_cast<Ctx*>(ud);
++        if (c->best.empty() || (preferred && !c->bestPreferred)) {
++          c->best.assign(tmpl);
++          if (c->best.size() > 768) c->best.resize(768);
++          c->bestPreferred = preferred;
++        }
++      },
++      nullptr);
++
++  const bool ok = XML_Parse(p, data, static_cast<int>(len), XML_TRUE) != XML_STATUS_ERROR;
++  destroyXmlParser(p);
++  if (!ok) return "";
++  return ctx.best;
++}
+diff --git a/lib/OpdsParser/OpdsParser.h b/lib/OpdsParser/OpdsParser.h
+index 9c93b89..027d925 100644
+--- a/lib/OpdsParser/OpdsParser.h
++++ b/lib/OpdsParser/OpdsParser.h
+@@ -50,8 +50,16 @@ class OpdsParser final : public Print {
+ 
+   // Disable copy
+   const std::string& getSearchTemplate() const { return searchTemplate; }
++  // URL of an OpenSearch description document advertised by the feed (rel="search",
++  // type="application/opensearchdescription+xml"). Empty when the feed inlines the
++  // template directly. Fetch this and pass its body to extractOpenSearchTemplate().
++  const std::string& getOpenSearchUrl() const { return openSearchUrl; }
+   const std::string& getNextPageUrl() const { return nextPageUrl; }
+   const std::string& getPrevPageUrl() const { return prevPageUrl; }
++
++  // Parse an OpenSearch description document and return the best URL template
++  // containing {searchTerms} (preferring an Atom/OPDS <Url>), or "" if none.
++  static std::string extractOpenSearchTemplate(const char* data, size_t len);
+   OpdsParser(const OpdsParser&) = delete;
+   OpdsParser& operator=(const OpdsParser&) = delete;
+ 
+@@ -89,6 +97,7 @@ class OpdsParser final : public Print {
+   static void XMLCALL characterData(void* userData, const XML_Char* s, int len);
+ 
+   std::string searchTemplate;
++  std::string openSearchUrl;
+   std::string nextPageUrl;
+   std::string prevPageUrl;
+   // Helper to find attribute value
+diff --git a/src/activities/browser/OpdsBookBrowserActivity.cpp b/src/activities/browser/OpdsBookBrowserActivity.cpp
+index 6ff5b71..6ad178d 100644
+--- a/src/activities/browser/OpdsBookBrowserActivity.cpp
++++ b/src/activities/browser/OpdsBookBrowserActivity.cpp
+@@ -28,6 +28,7 @@ void OpdsBookBrowserActivity::onEnter() {
+   entries.clear();
+   navigationHistory.clear();
+   searchTemplate = "";
++  searchResolveAttempted = false;
+   currentPath = "";
+   selectorIndex = 0;
+   consumeConfirm = false;
+@@ -213,11 +214,27 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
+     return;
+   }
+ 
+-  searchTemplate = parser.getSearchTemplate();
++  const std::string feedTemplate = parser.getSearchTemplate();
++  const std::string osdUrl = parser.getOpenSearchUrl();
+   const auto& nextUrl = parser.getNextPageUrl();
+   const auto& prevUrl = parser.getPrevPageUrl();
+   entries = std::move(parser).getEntries();
+ 
++  // Keep the search template across navigation (a sub-feed that doesn't
++  // re-advertise search shouldn't lose it). When search is only advertised
++  // indirectly via an OpenSearch description document, fetch that once and
++  // extract the real {searchTerms} template from it.
++  if (!feedTemplate.empty()) {
++    searchTemplate = feedTemplate;
++  } else if (searchTemplate.empty() && !searchResolveAttempted && !osdUrl.empty()) {
++    searchResolveAttempted = true;
++    const std::string osdFullUrl = UrlUtils::buildUrl(url, osdUrl);
++    std::string osdDoc;
++    if (HttpDownloader::fetchUrl(osdFullUrl, osdDoc, server.username, server.password) && !osdDoc.empty()) {
++      searchTemplate = OpdsParser::extractOpenSearchTemplate(osdDoc.c_str(), osdDoc.size());
++    }
++  }
++
+   if (!prevUrl.empty()) {
+     entries.insert(entries.begin(), OpdsEntry{OpdsEntryType::NAVIGATION, tr(STR_PREV_PAGE), "", prevUrl, ""});
+   }
+@@ -330,10 +347,26 @@ void OpdsBookBrowserActivity::performSearch(const std::string& query) {
+     return out;
+   };
+ 
+-  std::string url = searchTemplate;
+-  const std::string placeholder = "{searchTerms}";
+-  const size_t pos = url.find(placeholder);
+-  if (pos != std::string::npos) url.replace(pos, placeholder.length(), urlEncode(query));
++  // Expand the OpenSearch URL template: substitute the query into the
++  // {searchTerms} slot (which some servers namespace, e.g. {atom:searchTerms})
++  // and drop every other template parameter ({startIndex?}, {count?}, ...) so
++  // they are not percent-encoded and sent literally, which the server rejects.
++  const std::string encoded = urlEncode(query);
++  std::string url;
++  url.reserve(searchTemplate.size() + encoded.size());
++  for (size_t i = 0; i < searchTemplate.size();) {
++    if (searchTemplate[i] == '{') {
++      const size_t close = searchTemplate.find('}', i);
++      if (close == std::string::npos) {
++        url.append(searchTemplate, i, std::string::npos);
++        break;
++      }
++      if (searchTemplate.find("searchTerms", i) < close) url += encoded;
++      i = close + 1;
++    } else {
++      url += searchTemplate[i++];
++    }
++  }
+ 
+   navigationHistory.push_back(currentPath);  // <-- add this
+   currentPath = url;                         // <-- add this
+diff --git a/src/activities/browser/OpdsBookBrowserActivity.h b/src/activities/browser/OpdsBookBrowserActivity.h
+index 437ba58..d709563 100644
+--- a/src/activities/browser/OpdsBookBrowserActivity.h
++++ b/src/activities/browser/OpdsBookBrowserActivity.h
+@@ -32,6 +32,7 @@ class OpdsBookBrowserActivity final : public Activity {
+   std::vector<std::string> navigationHistory;
+   std::string currentPath;
+   std::string searchTemplate;
++  bool searchResolveAttempted = false;  // OpenSearch description doc is fetched at most once per session
+   bool consumeConfirm = false;
+   bool consumeBack = false;  // Added missing member
+   int selectorIndex = 0;
+-- 
+2.43.0
+

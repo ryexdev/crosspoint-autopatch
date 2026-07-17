@@ -21,7 +21,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.compare.outputs.tag }}
+      upstream_tag: ${{ steps.compare.outputs.upstream_tag }}
+      version: ${{ steps.compare.outputs.version }}
       build: ${{ steps.compare.outputs.build }}
     steps:
       - uses: actions/checkout@v6
@@ -34,10 +35,26 @@ jobs:
             echo "Could not read upstream latest release tag" >&2
             exit 1
           fi
+          # We publish at upstream's version with the patch component bumped by one.
+          # The on-device OTA updater only compares major.minor.patch, so this makes an
+          # autopatch build read as newer than the plain upstream release of the same
+          # tag (delivering the patches), while any later upstream release bumps our
+          # version again and supersedes it. Our tags never equal upstream's, so a new
+          # upstream release always retriggers a build.
+          BASE=${UPSTREAM_TAG#v}
+          MA=$(echo "$BASE" | cut -d. -f1)
+          MI=$(echo "$BASE" | cut -d. -f2)
+          PA=$(echo "$BASE" | cut -d. -f3 | grep -o '^[0-9]\+')
+          if [ -z "$MA" ] || [ -z "$MI" ] || [ -z "$PA" ]; then
+            echo "Unexpected upstream tag format: $UPSTREAM_TAG" >&2
+            exit 1
+          fi
+          OUR_VERSION="$MA.$MI.$((PA+1))"
           OWN_TAG=$(gh api "repos/${{ github.repository }}/releases/latest" -q .tag_name 2>/dev/null || echo "none")
-          echo "Upstream: $UPSTREAM_TAG  Ours: $OWN_TAG"
-          echo "tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
-          if [ "$UPSTREAM_TAG" = "$OWN_TAG" ]; then
+          echo "Upstream: $UPSTREAM_TAG  Ours would be: $OUR_VERSION  Current ours: $OWN_TAG"
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$OUR_VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$OUR_VERSION" = "$OWN_TAG" ]; then
             echo "build=false" >> "$GITHUB_OUTPUT"
           else
             echo "build=true" >> "$GITHUB_OUTPUT"
@@ -65,7 +82,7 @@ jobs:
 
       - name: Clone upstream at release tag
         run: |
-          git clone --depth 1 --branch "${{ needs.check.outputs.tag }}" \
+          git clone --depth 1 --branch "${{ needs.check.outputs.upstream_tag }}" \
             --recurse-submodules --shallow-submodules \
             "https://github.com/$UPSTREAM" upstream
 
@@ -79,6 +96,15 @@ jobs:
             echo "=== Applying $p"
             git apply --verbose "$p"
           done
+
+      # Bake our bumped version (upstream patch + 1) into the firmware so the
+      # on-device CROSSPOINT_VERSION matches the release tag and the OTA updater
+      # offers it. gh_release reads -DCROSSPOINT_VERSION from [crosspoint] version.
+      - name: Set autopatch version
+        working-directory: upstream
+        run: |
+          sed -i "s/^version = .*/version = ${{ needs.check.outputs.version }}/" platformio.ini
+          grep -n '^version = ' platformio.ini
 
       - uses: actions/setup-python@v6
         with:
@@ -106,11 +132,12 @@ jobs:
 
       - name: Publish release
         run: |
-          TAG="${{ needs.check.outputs.tag }}"
-          gh release create "$TAG" \
+          VERSION="${{ needs.check.outputs.version }}"
+          UPSTREAM_TAG="${{ needs.check.outputs.upstream_tag }}"
+          gh release create "$VERSION" \
             --repo "${{ github.repository }}" \
-            --title "CrossPoint $TAG + autopatch" \
-            --notes "Official [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) rebuilt with patches/ applied. Built by the autopatch workflow." \
+            --title "CrossPoint $VERSION (autopatch)" \
+            --notes "Built from upstream [$UPSTREAM_TAG](https://github.com/$UPSTREAM/releases/tag/$UPSTREAM_TAG) with patches/ applied. Version bumped to $VERSION so the on-device OTA updater offers it." \
             upstream/.pio/build/gh_release/firmware.bin \
             upstream/.pio/build/gh_release/bootloader.bin \
             upstream/.pio/build/gh_release/partitions.bin
@@ -118,9 +145,9 @@ jobs:
       - name: Open issue on failure
         if: failure()
         run: |
-          TAG="${{ needs.check.outputs.tag }}"
+          UPSTREAM_TAG="${{ needs.check.outputs.upstream_tag }}"
           gh issue create \
             --repo "${{ github.repository }}" \
-            --title "Autopatch build failed for $TAG" \
-            --body "The autopatch build for upstream release **$TAG** failed — most likely a patch no longer applies because upstream changed that code. See the [run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Review upstream's changes, refresh the patch in patches/, and re-run the workflow." \
+            --title "Autopatch build failed for upstream $UPSTREAM_TAG" \
+            --body "The autopatch build for upstream release **$UPSTREAM_TAG** failed — most likely a patch no longer applies because upstream changed that code. See the [run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Review upstream's changes, refresh the patch in patches/, and re-run the workflow." \
             || true
